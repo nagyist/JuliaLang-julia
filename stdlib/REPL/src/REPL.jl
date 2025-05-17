@@ -42,6 +42,7 @@ using Base.Meta, Sockets, StyledStrings
 using JuliaSyntaxHighlighting
 import InteractiveUtils
 import FileWatching
+import Base.JuliaSyntax: kind, @K_str, @KSet_str, Tokenize.tokenize
 
 export
     AbstractREPL,
@@ -451,8 +452,8 @@ function repl_backend_loop(backend::REPLBackend, get_module::Function)
             try
                 ret = f()
                 put!(backend.response_channel, Pair{Any, Bool}(ret, false))
-            catch err
-                put!(backend.response_channel, Pair{Any, Bool}(err, true))
+            catch
+                put!(backend.response_channel, Pair{Any, Bool}(current_exceptions(), true))
             end
         else
             ast = ast_or_func
@@ -593,11 +594,11 @@ function print_response(errio::IO, response, backend::Union{REPLBackendRef,Nothi
                 if val !== nothing && show_value
                     val2, iserr = if specialdisplay === nothing
                         # display calls may require being run on the main thread
-                        eval_with_backend(backend) do
+                        call_on_backend(backend) do
                             Base.invokelatest(display, val)
                         end
                     else
-                        eval_with_backend(backend) do
+                        call_on_backend(backend) do
                             Base.invokelatest(display, specialdisplay, val)
                         end
                     end
@@ -714,7 +715,7 @@ function run_frontend(repl::BasicREPL, backend::REPLBackendRef)
             (isa(ast,Expr) && ast.head === :incomplete) || break
         end
         if !isempty(line)
-            response = eval_with_backend(ast, backend)
+            response = eval_on_backend(ast, backend)
             print_response(repl, response, !ends_with_semicolon(line), false)
         end
         write(repl.terminal, '\n')
@@ -1165,21 +1166,23 @@ find_hist_file() = get(ENV, "JULIA_HISTORY",
 backend(r::AbstractREPL) = hasproperty(r, :backendref) ? r.backendref : nothing
 
 
-function eval_with_backend(ast::Expr, backend::REPLBackendRef)
+function eval_on_backend(ast, backend::REPLBackendRef)
     put!(backend.repl_channel, (ast, 1)) # (f, show_value)
     return take!(backend.response_channel) # (val, iserr)
 end
-function eval_with_backend(f, backend::REPLBackendRef)
+function call_on_backend(f, backend::REPLBackendRef)
+    applicable(f) || error("internal error: f is not callable")
     put!(backend.repl_channel, (f, 2)) # (f, show_value) 2 indicates function (rather than ast)
     return take!(backend.response_channel) # (val, iserr)
 end
 # if no backend just eval (used by tests)
-function eval_with_backend(f, backend::Nothing)
+eval_on_backend(ast, backend::Nothing) = error("no backend for eval ast")
+function call_on_backend(f, backend::Nothing)
     try
         ret = f()
         return (ret, false) # (val, iserr)
-    catch err
-        return (err, true)
+    catch
+        return (current_exceptions(), true)
     end
 end
 
@@ -1195,7 +1198,7 @@ function respond(f, repl, main; pass_empty::Bool = false, suppress_on_semicolon:
             local response
             try
                 ast = Base.invokelatest(f, line)
-                response = eval_with_backend(ast, backend(repl))
+                response = eval_on_backend(ast, backend(repl))
             catch
                 response = Pair{Any, Bool}(current_exceptions(), true)
             end
@@ -1700,49 +1703,16 @@ answer_color(r::StreamREPL) = r.answer_color
 input_color(r::LineEditREPL) = r.envcolors ? Base.input_color() : r.input_color
 input_color(r::StreamREPL) = r.input_color
 
-let matchend = Dict("\"" => r"\"", "\"\"\"" => r"\"\"\"", "'" => r"'",
-    "`" => r"`", "```" => r"```", "#" => r"$"m, "#=" => r"=#|#=")
-    global _rm_strings_and_comments
-    function _rm_strings_and_comments(code::Union{String,SubString{String}})
-        buf = IOBuffer(sizehint = sizeof(code))
-        pos = 1
-        while true
-            i = findnext(r"\"(?!\"\")|\"\"\"|'|`(?!``)|```|#(?!=)|#=", code, pos)
-            isnothing(i) && break
-            match = SubString(code, i)
-            j = findnext(matchend[match]::Regex, code, nextind(code, last(i)))
-            if match == "#=" # possibly nested
-                nested = 1
-                while j !== nothing
-                    nested += SubString(code, j) == "#=" ? +1 : -1
-                    iszero(nested) && break
-                    j = findnext(r"=#|#=", code, nextind(code, last(j)))
-                end
-            elseif match[1] != '#' # quote match: check non-escaped
-                while j !== nothing
-                    notbackslash = findprev(!=('\\'), code, prevind(code, first(j)))::Int
-                    isodd(first(j) - notbackslash) && break # not escaped
-                    j = findnext(matchend[match]::Regex, code, nextind(code, first(j)))
-                end
-            end
-            isnothing(j) && break
-            if match[1] == '#'
-                print(buf, SubString(code, pos, prevind(code, first(i))))
-            else
-                print(buf, SubString(code, pos, last(i)), ' ', SubString(code, j))
-            end
-            pos = nextind(code, last(j))
-        end
-        print(buf, SubString(code, pos, lastindex(code)))
-        return String(take!(buf))
-    end
-end
-
 # heuristic function to decide if the presence of a semicolon
 # at the end of the expression was intended for suppressing output
-ends_with_semicolon(code::AbstractString) = ends_with_semicolon(String(code))
-ends_with_semicolon(code::Union{String,SubString{String}}) =
-    contains(_rm_strings_and_comments(code), r";\s*$")
+function ends_with_semicolon(code)
+    semi = false
+    for tok in tokenize(code)
+        kind(tok) in KSet"Whitespace NewlineWs Comment EndMarker" && continue
+        semi = kind(tok) == K";"
+    end
+    return semi
+end
 
 function banner(io::IO = stdout; short = false)
     if Base.GIT_VERSION_INFO.tagged_commit
@@ -1835,7 +1805,7 @@ function run_frontend(repl::StreamREPL, backend::REPLBackendRef)
             if have_color
                 print(repl.stream, Base.color_normal)
             end
-            response = eval_with_backend(ast, backend)
+            response = eval_on_backend(ast, backend)
             print_response(repl, response, !ends_with_semicolon(line), have_color)
         end
     end
