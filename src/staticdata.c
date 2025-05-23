@@ -785,6 +785,12 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
         }
         goto done_fields; // for now
     }
+    if (s->incremental && jl_is_mtable(v)) {
+        jl_methtable_t *mt = (jl_methtable_t *)v;
+        // Any back-edges will be re-validated and added by staticdata.jl, so
+        // drop them from the image here
+        record_field_change((jl_value_t**)&mt->backedges, NULL);
+    }
     if (jl_is_method_instance(v)) {
         jl_method_instance_t *mi = (jl_method_instance_t*)v;
         if (s->incremental) {
@@ -800,12 +806,14 @@ static void jl_insert_into_serialization_queue(jl_serializer_state *s, jl_value_
                 // we only need 3 specific fields of this (the rest are restored afterward, if valid)
                 // in particular, cache is repopulated by jl_mi_cache_insert for all foreign function,
                 // so must not be present here
-                record_field_change((jl_value_t**)&mi->backedges, NULL);
                 record_field_change((jl_value_t**)&mi->cache, NULL);
             }
             else {
                 assert(!needs_recaching(v, s->query_cache));
             }
+            // Any back-edges will be re-validated and added by staticdata.jl, so
+            // drop them from the image here
+            record_field_change((jl_value_t**)&mi->backedges, NULL);
             // n.b. opaque closures cannot be inspected and relied upon like a
             // normal method since they can get improperly introduced by generated
             // functions, so if they appeared at all, we will probably serialize
@@ -2630,12 +2638,12 @@ static void jl_prune_module_bindings(jl_module_t * m) JL_GC_DISABLED
     jl_gc_wb(m, jl_atomic_load_relaxed(&bindingkeyset2));
 }
 
-static void strip_slotnames(jl_array_t *slotnames)
+static void strip_slotnames(jl_array_t *slotnames, int n)
 {
     // replace slot names with `?`, except unused_sym since the compiler looks at it
     jl_sym_t *questionsym = jl_symbol("?");
-    int i, l = jl_array_len(slotnames);
-    for (i = 0; i < l; i++) {
+    int i;
+    for (i = 0; i < n; i++) {
         jl_value_t *s = jl_array_ptr_ref(slotnames, i);
         if (s != (jl_value_t*)jl_unused_sym)
             jl_array_ptr_set(slotnames, i, questionsym);
@@ -2654,7 +2662,7 @@ static jl_value_t *strip_codeinfo_meta(jl_method_t *m, jl_value_t *ci_, jl_code_
     else {
         ci = (jl_code_info_t*)ci_;
     }
-    strip_slotnames(ci->slotnames);
+    strip_slotnames(ci->slotnames, jl_array_len(ci->slotnames));
     ci->debuginfo = jl_nulldebuginfo;
     jl_gc_wb(ci, ci->debuginfo);
     jl_value_t *ret = (jl_value_t*)ci;
@@ -2728,7 +2736,11 @@ static int strip_all_codeinfos__(jl_typemap_entry_t *def, void *_env)
             }
             jl_array_t *slotnames = jl_uncompress_argnames(m->slot_syms);
             JL_GC_PUSH1(&slotnames);
-            strip_slotnames(slotnames);
+            int tostrip = jl_array_len(slotnames);
+            // for keyword methods, strip only nargs to keep the keyword names at the end for reflection
+            if (jl_tparam0(jl_unwrap_unionall(m->sig)) == jl_typeof(jl_kwcall_func))
+                tostrip = m->nargs;
+            strip_slotnames(slotnames, tostrip);
             m->slot_syms = jl_compress_argnames(slotnames);
             jl_gc_wb(m, m->slot_syms);
             JL_GC_POP();
@@ -3047,9 +3059,9 @@ static void jl_save_system_image_to_stream(ios_t *f, jl_array_t *mod_array,
     int en = jl_gc_enable(0);
     if (native_functions) {
         size_t num_gvars, num_external_fns;
-        jl_get_llvm_gvs(native_functions, &num_gvars, NULL);
+        jl_get_llvm_gv_inits(native_functions, &num_gvars, NULL);
         arraylist_grow(&gvars, num_gvars);
-        jl_get_llvm_gvs(native_functions, &num_gvars, gvars.items);
+        jl_get_llvm_gv_inits(native_functions, &num_gvars, gvars.items);
         jl_get_llvm_external_fns(native_functions, &num_external_fns, NULL);
         arraylist_grow(&external_fns, num_external_fns);
         jl_get_llvm_external_fns(native_functions, &num_external_fns,
